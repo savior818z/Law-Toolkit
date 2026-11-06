@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""CRC text hierarchy parser and independent structural auditor.
+Standard library only. Usage: python crc_full_parser_fixed.py input.txt [output_prefix]
+Supports Titles 1-10, TOC/body detection, detached markers, rule histories,
+comments, JSON/JSONL/TXT output, and an explicit uncertainty report.
+Does NOT correct corrupted PDF text or infer missing legal provisions.
+"""
+import re
+import json
+import sys
+from pathlib import Path
+
+PAGE = re.compile(r'^\s*=====\s*PAGE\s+(\d+)\s*=====\s*$', re.I)
+TITLE = re.compile(r'^\s*TITLE\s+(\d+)\.?\s+(.+?)\s*$', re.I)
+DIV = re.compile(r'^\s*Division\s+(\d+)\.?\s+(.+?)\s*$', re.I)
+CHAP = re.compile(r'^\s*Chapter\s+(\d+)\.?\s+(.+?)\s*$', re.I)
+RULE = re.compile(r'^\s*Rule\s+(\d+\.\d+(?:\.\d+)?)\.?\s+(.+?)\s*$', re.I)
+RULE_IN_LINE = re.compile(r'\bRule\s+(\d+\.\d+(?:\.\d+)?)\.?\s+', re.I)
+MARK = re.compile(r'^(\s*)\(([a-z]|[A-Z]|\d+|[ivxlcdm]+)\)\s*(.*)$')
+RULE_HISTORY = re.compile(r'^\s*Rule\s+\d+\.\d+(?:\.\d+)?\s+(?:adopted|amended|repealed|renumbered|operative|effective)\b', re.I)
+SUBD_HISTORY = re.compile(r'^\s*\(?Subd\s+\([a-z]\)\)?\s+(?:adopted|amended|relettered|renumbered|repealed)\b', re.I)
+COMMENT = re.compile(r'^\s*Advisory\s+Committee\s+Comment', re.I)
+CROSSREF = re.compile(r'\b(?:rules?|sections?)\s+\d+\.\d+(?:\([^)]*\))*', re.I)
+
+
+def clean(s):
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def level(token):
+    if re.fullmatch(r'[ivxlcdm]{2,}', token): return 4
+    if re.fullmatch(r'[a-z]', token): return 1
+    if token.isdigit(): return 2
+    if re.fullmatch(r'[A-Z]', token): return 3
+    return None
+
+
+def split_rule_headings(s):
+    matches = list(RULE_IN_LINE.finditer(s))
+    return [(m.group(1), clean(s[m.end():matches[i+1].start() if i+1 < len(matches) else len(s)]))
+            for i, m in enumerate(matches)]
+
+
+def parse(source):
+    lines = source.splitlines()
+    nodes, by_id, warnings = [], {}, []
+    title_id = None
+    chapter_id = division_id = None
+    current = active = None
+    stack = {}
+    page = None
+    body = False
+    mode = 'toc'
+    pending = None
+    rule_occurrences = {}
+    body_started = set()
+    seen_marker = 0
+    detached = 0
+    def add(cid, parent, kind, heading, n):
+        if cid in by_id:
+            warnings.append({'line': n, 'type': 'duplicate_citation', 'citation': cid})
+            return by_id[cid]
+        obj = {'citation': cid, 'parent': parent, 'kind': kind, 'heading': clean(heading),
+               'text': '', 'raw_lines': [], 'history': [], 'comment': [], 'cross_references': [],
+               'source_line': n, 'end_line': n, 'page': page}
+        nodes.append(obj); by_id[cid] = obj
+        return obj
+    def append(obj, raw, n, field='text'):
+        if not obj: return
+        obj['end_line'] = n
+        if field == 'text':
+            obj['raw_lines'].append(raw)
+            obj['text'] += ('\n' if obj['text'] else '') + raw.strip()
+        else: obj[field].append(raw.strip())
+    def new_marker(token, heading, n):
+        nonlocal stack, active, seen_marker
+        k = level(token)
+        if k is None: return
+        candidates = [x for x in stack if x < k]
+        if k == 1: parent = current['citation']
+        else: parent = stack[max(candidates)] if candidates else current['citation']
+        if k >= 3 and not candidates:
+            warnings.append({'line': n, 'type': 'orphan_level', 'token': token, 'rule': current['citation']})
+        cid = parent + '(' + token + ')'
+        active = add(cid, parent, ['','subdivision','paragraph','subparagraph','clause'][k], heading, n)
+        stack = {x: y for x,y in stack.items() if x < k}
+        stack[k] = cid
+        seen_marker += 1
+
+    for n, raw in enumerate(lines, 1):
+        s = clean(raw)
+        p = PAGE.match(raw)
+        if p: page = int(p.group(1)); continue
+        if not s or re.fullmatch(r'\d{1,4}', s): continue
+        t = TITLE.match(raw)
+        if t:
+            title_id = 'CRC:TITLE' + t.group(1)
+            add(title_id, None, 'title', t.group(2), n)
+            continue
+        d = DIV.match(raw)
+        if d and not re.match(r'^(?:adopted|amended|repealed)\b', d.group(2), re.I):
+            if not title_id:
+                title_id = 'CRC:TITLE_UNKNOWN'
+                add(title_id, None, 'title', 'Title not detected', n)
+            division_id = title_id + ':DIVISION' + d.group(1)
+            add(division_id, title_id, 'division', d.group(2), n)
+            chapter_id = None; current = active = None; mode = 'toc'; body = False
+            continue
+        c = CHAP.match(raw)
+        if c and not re.match(r'^(?:adopted|amended|repealed)\b', c.group(2), re.I):
+            if not title_id:
+                title_id = 'CRC:TITLE_UNKNOWN'
+                add(title_id, None, 'title', 'Title not detected', n)
+            chapter_id = (division_id or title_id) + ':CHAPTER' + c.group(1)
+            add(chapter_id, division_id or title_id, 'chapter', c.group(2), n)
+            current = active = None; mode = 'toc'; body = False
+            continue
+        if RULE_HISTORY.match(raw):
+            if current:
+                append(current, raw, n, 'history')
+                mode = 'history'; active = None
+            continue
+        if SUBD_HISTORY.match(raw):
+            if current: append(current, raw, n, 'history')
+            continue
+        if COMMENT.match(raw):
+            mode = 'comment'; active = None; continue
+        r = RULE.match(raw)
+        if r:
+            parts = split_rule_headings(s)
+            if not parts: parts = [(r.group(1), r.group(2))]
+            first = None
+            for number, heading in parts:
+                cid = 'CRC:' + number
+                rule_occurrences[cid] = rule_occurrences.get(cid, 0) + 1
+                if cid not in by_id:
+                    if not title_id:
+                        title_id = 'CRC:TITLE' + number.split('.')[0]
+                        add(title_id, None, 'title', 'Rules of Court', n)
+                    add(cid, chapter_id or division_id or title_id, 'rule', heading, n)
+                if first is None: first = cid
+            if first:
+                current = by_id[first]
+                if first in body_started:
+                    warnings.append({'line': n, 'type': 'repeated_body_heading', 'citation': first})
+                elif rule_occurrences[first] >= 2 or (not re.match(r'^\s{24,}', raw) and mode != 'toc'):
+                    body_started.add(first)
+                # Single heading followed by operative text: detect below via marker or prose.
+                body = first in body_started
+                mode = 'body' if body else 'toc'
+                active = current if body else None
+                stack = {}; pending = None
+            continue
+        if current is None: continue
+        # If TOC only supplied one heading, a marker is strong evidence of operative text.
+        mm = MARK.match(raw)
+        if not body and mm:
+            body = True; body_started.add(current['citation']); mode = 'body'; active = current
+        if not body:
+            # Unmarked operative prose following a TOC heading is ambiguous. Keep it but flag.
+            if mode == 'toc' and not re.match(r'^\s*Rule\b', raw, re.I) and len(s) > 65:
+                body = True; body_started.add(current['citation']); mode = 'body'; active = current
+                warnings.append({'line': n, 'type': 'body_start_inferred', 'citation': current['citation']})
+            else: continue
+        if mode == 'comment': append(current, raw, n, 'comment'); continue
+        if mode == 'history':
+            # Preserve history continuation until a new rule heading.
+            append(current, raw, n, 'history'); continue
+        if mm:
+            token, remainder = mm.group(2), clean(mm.group(3))
+            if pending:
+                warnings.append({'line': n, 'type': 'consecutive_detached_markers', 'previous': pending[0], 'current': token})
+                # Keep both in a pending queue instead of fabricating attachment.
+                pending[2].append((token,n))
+                continue
+            if not remainder:
+                pending = (token,n,[(token,n)])
+                detached += 1
+                continue
+            new_marker(token, remainder, n)
+            continue
+        if pending:
+            token, first_line, queue = pending
+            if len(queue) == 1:
+                new_marker(token, s, first_line)
+                pending = None
+                continue
+            warnings.append({'line': n, 'type': 'unresolved_grouped_markers', 'markers': queue,
+                             'rule': current['citation'], 'following_text': s[:120]})
+            pending = None
+        append(active or current, raw, n)
+    if pending:
+        warnings.append({'type': 'unresolved_detached_marker', 'markers': pending[2]})
+    for obj in nodes:
+        if obj['text']:
+            obj['cross_references'] = sorted(set(CROSSREF.findall(obj['text'])))
+    rules = [x for x in nodes if x['kind'] == 'rule']
+    for r in rules:
+        if r['citation'] not in body_started:
+            warnings.append({'type': 'toc_only_rule', 'citation': r['citation'], 'line': r['source_line']})
+    return nodes, {'source_lines': len(lines), 'nodes': len(nodes), 'rules': len(rules),
+                   'markers_parsed': seen_marker, 'detached_markers_seen': detached,
+                   'rule_heading_occurrences': rule_occurrences, 'warnings': warnings}
+
+
+def tree(nodes):
+    children = {}
+    for x in nodes: children.setdefault(x['parent'], []).append(x)
+    out = []
+    def visit(x, prefix='', last=True):
+        out.append(prefix + (('└── ' if last else '├── ') if x['parent'] else '') + x['citation'] + ' — ' + x['heading'])
+        group = children.get(x['citation'], [])
+        lead = prefix + (('    ' if last else '│   ') if x['parent'] else '')
+        for i, child in enumerate(group): visit(child, lead, i == len(group)-1)
+    for x in children.get(None, []): visit(x)
+    return '\n'.join(out) + '\n'
+
+
+def main():
+    if len(sys.argv) < 2:
+        print('Usage: python crc_full_parser.py INPUT.txt [OUTPUT_PREFIX]')
+        sys.exit(2)
+    src = Path(sys.argv[1])
+    prefix = Path(sys.argv[2]) if len(sys.argv)>2 else src.with_suffix('')
+    nodes, audit = parse(src.read_text(encoding='utf-8-sig'))
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    prefix.with_name(prefix.name+'_tree.txt').write_text(tree(nodes), encoding='utf-8')
+    prefix.with_name(prefix.name+'_nodes.json').write_text(json.dumps(nodes, ensure_ascii=False, indent=2), encoding='utf-8')
+    prefix.with_name(prefix.name+'_nodes.jsonl').write_text(''.join(json.dumps(x, ensure_ascii=False)+'\n' for x in nodes), encoding='utf-8')
+    prefix.with_name(prefix.name+'_audit.json').write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(f"Rules={audit['rules']} Nodes={audit['nodes']} Markers={audit['markers_parsed']} Warnings={len(audit['warnings'])}")
+    print('Output prefix:', prefix)
+
+if __name__ == '__main__': main()
