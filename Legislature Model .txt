@@ -1,0 +1,47 @@
+CALIFORNIA CODES (30)
+└── CODE
+    └── DIVISION
+        ├── TITLE
+        ├── PART
+        │   └── TITLE
+        │       └── CHAPTER
+        │           └── ARTICLE
+        │               └── SECTION
+        │                   │
+        │                   ├── STATUTORY TEXT
+        │                   │   ├── (a)
+        │                   │   │   ├── (1)
+        │                   │   │   │   ├── (A)
+        │                   │   │   │   │   └── (i)
+        │                   │   │   │   └── (B)
+        │                   │   │   └── (2)
+        │                   │   └── (b)
+        │                   │
+        │                   └── LEGISLATIVE HISTORY
+        │                       └── CROSS-REFERENCE CHAPTERED BILLS
+        │                           └── BILL
+        │                               ├── Legislative Session
+        │                               ├── Bill Number
+        │                               ├── Statutes Year
+        │                               ├── Chapter Number
+        │                               ├── Bill Section
+        │                               │
+        │                               ├── BILL AMENDMENT
+        │                               │   ├── Original Bill Text
+        │                               │   ├── Amended Bill Text
+        │                               │   ├── (a)
+        │                               │   ├── (1)
+        │                               │   └── (A)
+        │                               │
+        │                               ├── CODE / BILL COMPARISON
+        │                               │   ├── Codified Section
+        │                               │   └── Chaptered Bill Section
+        │                               │
+        │                               └── LAW AS AMENDED
+        │                                   ├── Code Section
+        │                                   ├── Amended-Law Text
+        │                                   ├── (a)
+        │                                   ├── (1)
+        │                                   └── (A)
+        │
+        └── SECTION
