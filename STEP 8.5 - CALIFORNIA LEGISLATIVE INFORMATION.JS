@@ -1,5 +1,5 @@
 /*
- CALIFORNIA LEGISLATIVE INFORMATION — STEP 8.3
+ CALIFORNIA LEGISLATIVE INFORMATION — STEP 8.5
  VERIFIED DUAL-PANEL, DOM, CSS, XPATH, HIERARCHY AND LINK EXTRACTOR
 
  Browser-native JavaScript. Run in Microsoft Edge DevTools Console while viewing:
@@ -19,7 +19,7 @@
 (async function CA_STEP8_DUAL_PANEL_EXTRACTOR() {
   'use strict';
 
-  // Step 8.3: DOM-semantic comparisons and legislative action classification.
+  // Step 8.5: DOM-semantic comparisons and legislative action classification.
   // JSF navigation is completed separately by the companion Selenium verifier.
   // This browser script never submits a form automatically.
   // -------------------------- CONFIGURATION -------------------------------
@@ -38,6 +38,8 @@
     CONSOLE_SHOW_SUBDIVISIONS: true,
     CONSOLE_SHOW_DOM_ELEMENTS: false, // can be large; toggle when debugging
     CONSOLE_SHOW_LINKS: true,
+    CONSOLE_SHOW_URL_REGISTRY: true,
+    CONSOLE_SHOW_PDF_LINKS: true,
     CONSOLE_FULL_JSON: false,       // true = print complete export to console
     CONSOLE_MAX_ROWS: 100,
     MAX_TEXT_PREVIEW: 200,
@@ -47,7 +49,7 @@
 
   // Selenium sets this global to collect without triggering a duplicate browser download.
   if (window.CA_STEP8_AUTOMATED_CAPTURE === true) CONFIG.DOWNLOAD_TXT = false;
-  const SCHEMA_VERSION = '8.3';
+  const SCHEMA_VERSION = '8.5';
   const url = new URL(location.href);
   const assert = (ok, message) => { if (!ok) throw Error(message); };
   assert(url.hostname === 'leginfo.legislature.ca.gov', 'Unexpected origin: ' + url.origin);
@@ -376,6 +378,54 @@
   if (anchors.length > CONFIG.MAX_ANCHORS_PER_PAGE)
     warnings.push('PAGE_ANCHOR_INVENTORY_TRUNCATED:' + anchors.length);
   const allLinks = anchors.slice(0, CONFIG.MAX_ANCHORS_PER_PAGE).map(anchorDescriptor);
+  // ---- Step 8.5: observed-URL inventory, including PDF references. ----
+  // Never invent a PDF URL: javascript/JSF controls are unresolved until browser navigation.
+  const PDF_RE = /\.pdf(?:$|[?#])/i;
+  const isPdfish = (u, mime, label) => Boolean(
+    PDF_RE.test(u || '') || /application\/pdf/i.test(mime || '') ||
+    /\b(?:download|view|open|print)\s+(?:as\s+)?pdf\b|\bpdf\b/i.test(label || '')
+  );
+  const observedURLMap = new Map();
+  function addObservedURL(value, category, evidence, label, hint) {
+    if (!value) return;
+    try {
+      const parsed = new URL(value, location.href);
+      if (!/^https?:$/.test(parsed.protocol)) return;
+      const key=parsed.href;
+      const entry=observedURLMap.get(key) || {
+        url:key, observed_in_dom:true, kinds:[], evidence:[],
+        likely_pdf:false, pdf_content_verified:false,
+        pdf_status:'NOT_FETCHED_OR_OPENED'
+      };
+      if (!entry.kinds.includes(category)) entry.kinds.push(category);
+      if (entry.evidence.length<25) entry.evidence.push({source:evidence,label:label || null});
+      entry.likely_pdf ||= isPdfish(key,hint,label);
+      observedURLMap.set(key,entry);
+    } catch (_) { /* Invalid URL is retained in original DOM/onclick metadata. */ }
+  }
+  addObservedURL(location.href,'SOURCE_PAGE','window.location','Comparison page');
+  for (const link of allLinks) {
+    if (link.resolved_url) addObservedURL(link.resolved_url,'ANCHOR_HREF',link.css_selector,link.label);
+    if (link.form_action_url) addObservedURL(link.form_action_url,'FORM_ACTION',link.css_selector,link.label);
+  }
+  for (const el of document.querySelectorAll('[src],[href],[data],[action],[poster],[data-url],[data-href],[formaction]')) {
+    for (const attr of ['src','href','data','action','poster','data-url','data-href','formaction']) {
+      const raw=el.getAttribute(attr);
+      if (!raw || /^#|^javascript:|^data:|^blob:/i.test(raw)) continue;
+      addObservedURL(raw,'DOM_ATTRIBUTE:'+attr,cssPath(el),normalize(el.innerText||el.textContent).slice(0,100),el.getAttribute('type'));
+    }
+  }
+  const observedURLs=[...observedURLMap.values()];
+  const observedPDFs=observedURLs.filter(x=>x.likely_pdf);
+  const pdfControls=[...document.querySelectorAll('a,button,input[type="button"],input[type="submit"]')]
+    .filter(el=>isPdfish('',el.getAttribute('type'),normalize(el.innerText||el.textContent||el.value)))
+    .map(el=>({label:normalize(el.innerText||el.textContent||el.value),
+      css_selector:cssPath(el),xpath:fullXPath(el),
+      href:el.getAttribute('href'),onclick_source:el.getAttribute('onclick'),
+      status:'PDF_LABELED_CONTROL_DESTINATION_UNVERIFIED'}));
+  const pdfLinkStatus=observedPDFs.length ? 'OBSERVED_URLS_NOT_FETCHED' :
+    (pdfControls.length ? 'PDF_CONTROLS_NO_VERIFIED_DIRECT_URL' : 'NO_PDF_LINK_OBSERVED_ON_THIS_PAGE');
+
   function linkById(id) {return allLinks.find(a => a.element_id === id) || null;}
   const amended = linkById('dispcodebillid:displayAsAmend');
   const back = linkById('dispcodebillid:goBackBtn');
@@ -496,9 +546,18 @@
         status:back?.destination_status||'CONTROL_NOT_FOUND'},
       all_observed_hrefs:allLinks.filter(a=>a.resolved_url)
         .map(a=>({label:a.label,url:a.resolved_url,selector:a.css_selector,source_type:a.type})),
+      all_observed_urls:observedURLs,
+      observed_pdf_urls:observedPDFs,
+      pdf_labeled_controls:pdfControls,
+      pdf_discovery_status:pdfLinkStatus,
+      law_as_amended_link:{direct_get_url:null,method:'JSF_FORM_POST',
+        form_action_url:amended?.form_action_url||null,onclick_source:amended?.onclick_source||null,
+        parameters:amended?.jsf_parameters||{},
+        destination_url:null,status:'PENDING_REAL_BROWSER_NAVIGATION'},
     },
     comparison:textComparison(current,historical),
     validation:{warnings,warning_count:warnings.length,
+      observed_url_count:observedURLs.length, observed_pdf_url_count:observedPDFs.length,
       current_text_observed_length:currentText.length,
       historical_text_observed_length:historicalText.length,
       both_panels_present:true,
@@ -519,9 +578,10 @@
   };
   window.CA_STEP8_DUAL_PANEL = result;
   window.CA_STEP8_URLS = result.url_inventory;
+  window.CA_STEP8_PDF_URLS = result.url_inventory.observed_pdf_urls;
 
   if (CONFIG.DOWNLOAD_TXT) {
-    const name = 'STEP8_3_' + code + '_' + section.replace(/[^A-Za-z0-9.-]/g,'_') +
+    const name = 'STEP8_5_' + code + '_' + section.replace(/[^A-Za-z0-9.-]/g,'_') +
       '_' + versionId + '_' + (CONFIG.INCLUDE_BOTH_FULL_PANELS ? 'BOTH' : 'HISTORICAL') + '_DOM_HIERARCHY.txt';
     const blob = new Blob([JSON.stringify(result,null,2)],{type:'text/plain;charset=utf-8'});
     const objectURL=URL.createObjectURL(blob);
@@ -587,6 +647,23 @@
         url:link.resolved_url ?? null,
         css:link.css_selector ?? ''
       }))));
+      if (CONFIG.CONSOLE_SHOW_URL_REGISTRY) {
+        console.groupCollapsed('ALL observed URLs — link, form, resource');
+        console.table(display(result.url_inventory.all_observed_urls.map(u => ({
+          url:u.url, kinds:u.kinds.join(', '), likely_pdf:u.likely_pdf,
+          evidence_count:u.evidence.length
+        }))));
+        console.groupEnd();
+      }
+      if (CONFIG.CONSOLE_SHOW_PDF_LINKS) {
+        console.groupCollapsed('PDF links + PDF-labeled controls');
+        console.info('PDF discovery:', result.url_inventory.pdf_discovery_status);
+        console.table(result.url_inventory.observed_pdf_urls.map(x=>({url:x.url,kinds:x.kinds.join(', '),status:x.pdf_status})));
+        console.table(result.url_inventory.pdf_labeled_controls);
+        console.groupEnd();
+      }
+      console.info('LAW AS AMENDED — observed JSF POST (not a verified PDF URL):',
+        result.url_inventory.law_as_amended_link);
       console.info('JSF destination verification remains pending until Selenium visits it.');
       console.groupEnd();
     }
