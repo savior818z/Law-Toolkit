@@ -1,0 +1,150 @@
+// STEP 6 — INDIVIDUAL CODE SECTION CAPTURE + CROSS-REFERENCE SEEDS
+// Paste into Edge DevTools on a California codes_displaySection.xhtml page.
+// Export: STEP6_<CODE>_<SECTION>_SECTION_CAPTURE.txt (UTF-8 JSON)
+// No network requests, navigation, or automatic JSF form submissions.
+// Bill URLs are constructed only when a bill number is present in the current DOM.
+// Cross-reference chaptered bills is a JSF POST action, NOT a direct link.
+(() => {
+  'use strict';
+
+  // 1. Verify that this is an individual Code section page.
+  const page = new URL(location.href);
+  if (page.pathname !== '/faces/codes_displaySection.xhtml') {
+    throw Error('Open /faces/codes_displaySection.xhtml before running Step 6.');
+  }
+  const code = (page.searchParams.get('lawCode') || '').toUpperCase();
+  const section = page.searchParams.get('sectionNum') || '';
+  if (!/^[A-Z]{2,5}$/.test(code) || !section) {
+    throw Error('Missing or invalid lawCode / sectionNum URL parameters.');
+  }
+
+  // 2. Source-backed selector: confirmed in the uploaded DOM inspection.
+  const root = document.querySelector('#single_law_section');
+  if (!root) throw Error('Missing #single_law_section. Save the DOM inspection for review.');
+  const norm = el => (el?.textContent || '').replace(/\s+/g, ' ').trim();
+  const xpath = el => {
+    if (!el) return null;
+    const parts = [];
+    for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+      if (n.id && !n.id.includes("'")) {
+        parts.unshift(`*[@id='${n.id}']`);
+        break;
+      }
+      const siblings = n.parentElement
+        ? [...n.parentElement.children].filter(s => s.tagName === n.tagName)
+        : [n];
+      parts.unshift(`${n.tagName.toLowerCase()}[${siblings.indexOf(n) + 1}]`);
+    }
+    return '//' + parts.join('/');
+  };
+
+  // 3. Capture every heading (h1–h6); do not presume fixed legal hierarchy order.
+  const headings = [...root.querySelectorAll('h1,h2,h3,h4,h5,h6')].map((el, index) => ({
+    index, tag: el.tagName.toLowerCase(), text: norm(el), xpath: xpath(el), html: el.outerHTML
+  }));
+
+  // 4. Preserve paragraphs as ordered HTML/text blocks; retain subdivisions verbatim.
+  const paragraphs = [...root.querySelectorAll('p')].map((el, index) => ({
+    index, text: norm(el), xpath: xpath(el), html: el.outerHTML
+  }));
+
+  // 5. Parse legislative notes from the Code section without fetching any bills.
+  // Some section pages place the note in a bare <i>, not inside a <p>.
+  const notePattern = /\b(?:Added|Amended|Repealed|Enacted)\s+by\s+Stats\.|\bStats\.\s*\d{4}\s*,\s*Ch\./i;
+  const noteNodes = [...root.querySelectorAll('i,em,p')].filter(el => {
+    if (!notePattern.test(norm(el))) return false;
+    // If a paragraph contains an italic child, record the italic only once.
+    return !(el.matches('p') && [...el.querySelectorAll('i,em')]
+      .some(child => notePattern.test(norm(child))));
+  });
+  const notes = noteNodes.map(el => {
+    const value = norm(el);
+    const bill = value.match(/\b(AB|SB|ACA|SCA|AJR|SJR|ACR|SCR)\s*(\d+)\b/i);
+    const stats = value.match(/Stats\.\s*(\d{4})\s*,\s*Ch\.\s*(\d+)\s*,\s*Sec\.\s*([\d.]+)/i);
+    const billId = bill ? `${bill[1].toUpperCase()} ${bill[2]}` : null;
+    const year = stats ? Number(stats[1]) : null;
+    // Modern biennial-session inference only. Historic sessions require confirmation.
+    const first = year && year >= 1973 ? (year % 2 ? year : year - 1) : null;
+    const leginfoId = (first && bill) ? `${first}${first + 1}0${bill[1].toUpperCase()}${bill[2]}` : null;
+    const billNav = leginfoId ? new URL('/faces/billNavClient.xhtml', page.origin) : null;
+    const billText = leginfoId ? new URL('/faces/billTextClient.xhtml', page.origin) : null;
+    if (billNav) billNav.searchParams.set('bill_id', leginfoId);
+    if (billText) billText.searchParams.set('bill_id', leginfoId);
+    return {
+      text: value, xpath: xpath(el), original_html: el.outerHTML,
+      bill_id: billId, stats_year: stats?.[1] || null,
+      chapter: stats?.[2] || null, bill_section: stats?.[3] || null,
+      legislative_session: first ? `${first}-${first + 1}` : null,
+      leginfo_bill_id: leginfoId,
+      bill_navigation_url: billNav?.href || null,
+      bill_text_url: billText?.href || null,
+      bill_url_status: leginfoId ? 'GENERATED_NOT_VERIFIED' : 'UNRESOLVED'
+    };
+  });
+
+  // 6. Capture JSF actions, especially the chaptered-bills cross-reference link.
+  // Important: href="#" is NOT the target URL. The onclick uses a JSF form POST.
+  const actionNames = ['goUp','previous','next','crossRef','pdf_link'];
+  const actions = actionNames.map(name => {
+    const a = document.getElementById(`displayCodeSection:${name}`);
+    return {
+      action: name, present: !!a, label: norm(a),
+      xpath: xpath(a), raw_href: a?.getAttribute('href') || null,
+      onclick: a?.getAttribute('onclick') || null,
+      original_html: a?.outerHTML || null,
+      requires_jsf_form_submission: !!(a && a.getAttribute('onclick')?.includes('jsfcljs')),
+      resolved_destination_url: null // Only know this after an authorized navigation.
+    };
+  });
+
+  // 7. Build the official direct section URL from captured page parameters.
+  const canonical = new URL('/faces/codes_displaySection.xhtml', page.origin);
+  canonical.searchParams.set('lawCode', code);
+  canonical.searchParams.set('sectionNum', section);
+
+  // 8. Capture section-contained anchors only; exclude navigation chrome.
+  const links = [...root.querySelectorAll('a[href]')].map(a => ({
+    text: norm(a), xpath: xpath(a), raw_href: a.getAttribute('href'),
+    url: /^https?:/i.test(a.href) ? a.href : null,
+    original_html: a.outerHTML
+  }));
+
+  // 9. Preserve HTML, metadata and provenance for a later checksum/ETL pass.
+  const result = {
+    schema_version: '6.0', step: '6-individual-section-capture',
+    code, section, authority_id: `${code}:${section}`,
+    captured_at: new Date().toISOString(),
+    source_url: location.href, canonical_section_url: canonical.href,
+    document_title: document.title,
+    verification_scope: 'Current opened page DOM only; bill URLs generated, not fetched',
+    selectors: {content_root: '#single_law_section', cross_reference: '#displayCodeSection\\:crossRef'},
+    summary: {
+      headings: headings.length, paragraphs: paragraphs.length,
+      legislative_notes: notes.length, source_links: links.length,
+      cross_reference_action_present: actions.some(a => a.action === 'crossRef' && a.present)
+    },
+    headings, paragraphs, legislative_notes: notes,
+    section_links: links, navigation_actions: actions,
+    section_text: norm(root), section_html: root.outerHTML,
+    next_stage: {
+      step: '6.1', task: 'Open the cross-reference chaptered bills action in the browser, then inspect and capture the resulting DOM',
+      manual_action_required: true,
+      reason: 'JSF onclick uses POST; the original href does not contain a destination URL'
+    }
+  };
+
+  // 10. Show a compact preview and export TXT containing JSON.
+  window.CA_STEP6_SECTION_CAPTURE = result;
+  console.table(notes.map(n => ({bill:n.bill_id, year:n.stats_year,
+    chapter:n.chapter, url:n.bill_navigation_url})));
+  console.log('STEP 6 SUMMARY', result.summary);
+  const output = JSON.stringify(result, null, 2);
+  const blob = new Blob([output], {type:'text/plain;charset=utf-8'});
+  const download = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = download;
+  a.download = `STEP6_${code}_${section.replace(/[^A-Za-z0-9.-]/g,'_')}_SECTION_CAPTURE.txt`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(download), 5000);
+  return result;
+})();
