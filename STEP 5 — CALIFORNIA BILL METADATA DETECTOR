@@ -1,0 +1,374 @@
+// ============================================================================
+// STEP 5 — CALIFORNIA BILL METADATA DETECTOR + FULL BILL URLS (COMMENTED)
+// ============================================================================
+// PURPOSE
+//   Read the CURRENT California Legislative Information codes_displayText.xhtml
+//   page and identify which legislative notes refer to bills or chaptered laws.
+//   Produce a UTF-8 TXT download containing structured JSON for future crawling.
+//
+// HOW TO USE
+//   1. Open a codes_displayText.xhtml page in Microsoft Edge.
+//   2. Open DevTools (F12) > Console.
+//   3. Paste this script and run it.
+//   4. Open STEP5_<CODE>_BILL_METADATA_WITH_URLS.txt from Downloads.
+//
+// OUTPUT CONTENTS
+//   - Statutory sections and their original source section URLs.
+//   - JSF submitCodesValues(...) arguments, original anchor HTML, and XPath.
+//   - Section-level legislative notes, year, chapter, and bill identifier.
+//   - Hierarchy heading notes (DIVISION, PART, TITLE, CHAPTER, etc.).
+//   - Full generated bill navigation and bill text URLs.
+//   - Unique bill list for Step 6 to crawl without redundant requests.
+//
+// IMPORTANT LIMITATIONS
+//   - NO requests are sent; the script only reads the currently loaded DOM.
+//   - Bill URLs are generated, NOT fetched or verified.
+//   - The Statutes year is used to INFER a biennial session. Historical or
+//     exceptional cases require validation against an authoritative source.
+//   - A chaptered-law note is not the complete legislative history of a section.
+//   - XPath is a snapshot locator and may change when the source DOM changes.
+// ============================================================================
+
+(() => {
+  "use strict";
+
+  // --------------------------------------------------------------------------
+  // 1. VALIDATE THE CURRENT PAGE
+  // --------------------------------------------------------------------------
+  // Reject other LegInfo page types: their HTML structures may differ.
+  const page = new URL(location.href);
+  if (page.pathname !== "/faces/codes_displayText.xhtml") {
+    throw Error("Open a codes_displayText.xhtml page first.");
+  }
+
+  // The loaded page places its statutory headings and section blocks here.
+  const root = document.querySelector("#manylawsections");
+  if (!root) throw Error("#manylawsections not found.");
+
+  // First read the lawCode query parameter; otherwise try the H3 code heading.
+  // Valid examples: CIV, CCP, EVID, PEN, GOV, CONS.
+  const code = (page.searchParams.get("lawCode") ||
+    root.querySelector("h3")?.textContent.match(/\b([A-Z]{2,5})\b\s*$/)?.[1] || "").toUpperCase();
+  if (!/^[A-Z]{2,5}$/.test(code)) throw Error("Unable to identify lawCode.");
+
+  // --------------------------------------------------------------------------
+  // 2. SHARED DOM HELPERS
+  // --------------------------------------------------------------------------
+  // Collapse repeated whitespace so legislative-note regexes work across
+  // line breaks, indentation, and extra spaces in the site HTML.
+  const normalize = el => (el?.textContent || "").replace(/\s+/g, " ").trim();
+
+  // Build a DOM XPath that stops at an ancestor with a stable ID, when found.
+  // Example: //*[@id='manylawsections']/div[5]/font[1]/div[2]/p[20]
+  // XPath locators document provenance; they are not long-term stable IDs.
+  const xpath = el => {
+    if (!el) return null;
+    const parts = [];
+    for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+      // A quote-free ID can be inserted safely as a single-quoted XPath literal.
+      if (n.id && !n.id.includes("'")) {
+        parts.unshift(`*[@id='${n.id}']`);
+        break;
+      }
+      // For nodes without a suitable ID, record their same-tag sibling index.
+      const siblings = n.parentElement
+        ? [...n.parentElement.children].filter(c => c.tagName === n.tagName)
+        : [n];
+      parts.unshift(`${n.tagName.toLowerCase()}[${siblings.indexOf(n) + 1}]`);
+    }
+    return "//" + parts.join("/");
+  };
+
+  // --------------------------------------------------------------------------
+  // 3. CONSTRUCT COMPLETE BILL URLs
+  // --------------------------------------------------------------------------
+  // Inputs: a bill designation ('SB 644') and a Statutes year ('2023').
+  // Outputs: session, LegInfo bill_id, navigation URL, text URL, and status.
+  // A missing or unrecognized bill returns null URL fields instead of guesses.
+  const billURLFields = (billId, statsYear) => {
+    if (!billId || !statsYear) return {
+      legislative_session: null,
+      leginfo_bill_id: null,
+      bill_navigation_url: null,
+      bill_text_url: null,
+      bill_url_status: "UNRESOLVED"
+    };
+
+    // Match supported legislative designations (Assembly/Senate bills,
+    // constitutional amendments, and joint/concurrent resolutions).
+    const match = String(billId).match(/^(AB|SB|ACA|SCA|AJR|SJR|ACR|SCR)\s+(\d+)$/i);
+    const year = Number(statsYear);
+    if (!match || !Number.isInteger(year) || year < 1850 || year > 2200) return {
+      legislative_session: null,
+      leginfo_bill_id: null,
+      bill_navigation_url: null,
+      bill_text_url: null,
+      bill_url_status: "UNRESOLVED"
+    };
+
+    // Modern California regular sessions are biennial: odd year + next year.
+    // The Stats. year is a session INFERENCE, not proof of the actual bill session.
+    const first = year % 2 === 1 ? year : year - 1;
+    const last = first + 1;
+    const session = `${first}${last}`;
+
+    // LegInfo bill ID pattern:
+    //   YYYY + YYYY + '0' + BILL_TYPE + BILL_NUMBER
+    // Example: 2023 + 2024 + 0 + SB + 644 = 202320240SB644.
+    const leginfoId = `${session}0${match[1].toUpperCase()}${match[2]}`;
+
+    // Construct BOTH navigation and full bill text landing-page URLs.
+    const nav = new URL("/faces/billNavClient.xhtml", location.origin);
+    const text = new URL("/faces/billTextClient.xhtml", location.origin);
+    nav.searchParams.set("bill_id", leginfoId);
+    text.searchParams.set("bill_id", leginfoId);
+
+    return {
+      legislative_session: `${first}-${last}`,
+      leginfo_bill_id: leginfoId,
+      bill_navigation_url: nav.href,
+      bill_text_url: text.href,
+      bill_url_status: "GENERATED_NOT_VERIFIED"
+    };
+  };
+
+  // --------------------------------------------------------------------------
+  // 4. INTERPRET AN INDIVIDUAL LEGISLATIVE NOTE
+  // --------------------------------------------------------------------------
+  // Example source note:
+  //   (Amended by Stats. 2023, Ch. 718, Sec. 2. (SB 644)
+  //    Effective January 1, 2024.)
+  //
+  // Important: 'Sec. 2' here refers to a section of the chaptered law,
+  // NOT necessarily Civil Code section 2.
+  const interpret = value => {
+    // Look for an explicit bill designation embedded in the note.
+    const bill = value.match(/\b(AB|SB|ACA|SCA|AJR|SJR|ACR|SCR)\s*(\d+)\b/i);
+
+    // Extract Statutes year, chapter number, and chaptered-law section number.
+    const stats = value.match(/Stats\.\s*(\d{4})\s*,\s*Ch\.\s*(\d+)\s*,\s*Sec\.\s*([\d.]+)/i);
+
+    // Preserve the printed effective date when it fits 'Month DD, YYYY'.
+    const effective = value.match(/Effective\s+([A-Za-z]+\s+\d{1,2},\s*\d{4})/i);
+    const billId = bill ? `${bill[1].toUpperCase()} ${bill[2]}` : null;
+    const statsYear = stats?.[1] || null;
+
+    return {
+      bill_id: billId,
+      stats_year: statsYear,
+      chapter: stats?.[2] || null,
+      bill_section: stats?.[3] || null,
+      effective_date_text: effective?.[1]?.trim() || null,
+
+      // Classify what the note says happened to the section or heading.
+      operation: /\bAmended by\b/i.test(value) ? "AMENDED"
+        : /\bAdded by\b/i.test(value) ? "ADDED"
+        : /\bRepealed by\b/i.test(value) ? "REPEALED"
+        : /\bEnacted\b/i.test(value) ? "ENACTED" : "UNKNOWN",
+
+      // Append a complete bill URL where both bill ID and year are known.
+      ...billURLFields(billId, statsYear)
+    };
+  };
+
+  // --------------------------------------------------------------------------
+  // 5. EXTRACT STATUTORY SECTION RECORDS
+  // --------------------------------------------------------------------------
+  // On this site, H6 contains the statutory section anchor and
+  // submitCodesValues(...) holds section navigation information.
+  const sectionRecords = [...root.querySelectorAll('h6 a[href*="submitCodesValues"]')]
+    .map(a => {
+      // The parent DIV of the H6 includes the section's text paragraphs
+      // and the end-of-section amendment/enactment note.
+      const wrapper = a.closest("h6")?.parentElement;
+      if (!wrapper) return null;
+
+      // Preserve section-number punctuation exactly as displayed, e.g. 1748.40.
+      const section = normalize(a);
+
+      // Capture all six quoted submitCodesValues(...) arguments in source order.
+      // These values are provenance metadata, not a substitute for bill notes.
+      const args = [...(a.getAttribute("href") || "").matchAll(/['"]([^'"]*)['"]/g)]
+        .map(m => m[1]);
+
+      // Select only paragraphs whose text explicitly describes a statutory
+      // operation '... by Stats.'; do not classify ordinary legal prose as a note.
+      const notes = [...wrapper.querySelectorAll("p")]
+        .filter(p => /\b(?:Amended|Added|Repealed|Enacted)\s+by\s+Stats\./i.test(normalize(p)))
+        .map(p => ({
+          text: normalize(p),
+          ...interpret(normalize(p)),
+          xpath: xpath(p),
+          original_html: p.outerHTML
+        }));
+
+      // Construct the source's individual statutory section URL separately
+      // from the bill URLs. This is the Step 5 SECTION crawl seed.
+      const sectionUrl = new URL("/faces/codes_displaySection.xhtml", location.origin);
+      sectionUrl.searchParams.set("lawCode", code);
+      sectionUrl.searchParams.set("sectionNum", section);
+
+      return {
+        type: "STATUTORY_SECTION",
+        code,
+        section,
+        authority_id: `${code}:${section}`,
+        section_url: sectionUrl.href,
+        jsf_args: args,
+        section_container_xpath: xpath(wrapper),
+        anchor_html: a.outerHTML,
+        bill_notes: notes
+      };
+    }).filter(Boolean);
+
+  // --------------------------------------------------------------------------
+  // 6. BUILD A YEAR:CHAPTER -> BILL INDEX FROM EXPLICIT SECTION NOTES
+  // --------------------------------------------------------------------------
+  // Heading notes may say 'Stats. 2023, Ch. 718' without stating 'SB 644'.
+  // A section note from the SAME chapter can supply the missing bill number.
+  // Store a Set because multiple conflicting bill IDs must be treated as
+  // ambiguous, not silently resolved to the first match.
+  const chapterBills = new Map();
+  for (const section of sectionRecords) {
+    for (const note of section.bill_notes) {
+      if (!note.stats_year || !note.chapter || !note.bill_id) continue;
+      const key = `${note.stats_year}:${Number(note.chapter)}`;
+      if (!chapterBills.has(key)) chapterBills.set(key, new Set());
+      chapterBills.get(key).add(note.bill_id);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // 7. EXTRACT HIERARCHY HEADING NOTES AND RESOLVE BILL IDs
+  // --------------------------------------------------------------------------
+  // These H3/H4/H5 headings identify structural legal hierarchy levels.
+  // Their adjacent italicized notes describe additions/amendments to headings.
+  // Match a heading note to a bill ONLY on a UNIQUE year+chapter match.
+  const headingRecords = [...root.querySelectorAll("h3,h4,h5")]
+    .map(h => {
+      const parent = h.parentElement;
+      const note = [...parent.querySelectorAll("i")]
+        .find(el => /\bStats\.\s*\d{4}/i.test(normalize(el)));
+      if (!note) return null;
+
+      const parsed = interpret(normalize(note));
+      const key = parsed.stats_year && parsed.chapter
+        ? `${parsed.stats_year}:${Number(parsed.chapter)}` : null;
+      const candidates = key ? [...(chapterBills.get(key) || [])] : [];
+
+      // Distinguish a bill explicitly named in the heading note from one
+      // inferred by matching a nearby section's year/chapter metadata.
+      let resolution = parsed.bill_id ? "EXPLICIT_IN_HEADING" : "UNRESOLVED";
+      if (!parsed.bill_id && candidates.length === 1) {
+        parsed.bill_id = candidates[0];
+        Object.assign(parsed, billURLFields(parsed.bill_id, parsed.stats_year));
+        resolution = "MATCHED_BY_STATS_YEAR_AND_CHAPTER";
+      } else if (!parsed.bill_id && candidates.length > 1) {
+        resolution = "AMBIGUOUS_CHAPTER_MATCH";
+      }
+
+      return {
+        type: "HIERARCHY_HEADING",
+        heading_tag: h.tagName.toLowerCase(),
+        heading: normalize(h),
+        note: normalize(note),
+        ...parsed,
+        bill_resolution: resolution,
+        bill_candidates: candidates,
+        xpath: xpath(note),
+        original_html: note.outerHTML
+      };
+    }).filter(Boolean);
+
+  // --------------------------------------------------------------------------
+  // 8. BUILD A DEDUPLICATED BILL URL SEED INVENTORY
+  // --------------------------------------------------------------------------
+  // The same bill may affect multiple sections AND hierarchy headings.
+  // Deduplicate by LegInfo bill_id, while retaining the source relationships.
+  // This lets Step 6 fetch each unique bill just once.
+  const uniqueBills = new Map();
+  for (const item of [
+    ...sectionRecords.flatMap(s => s.bill_notes.map(n => ({ ...n, source: s.authority_id }))),
+    ...headingRecords.map(n => ({ ...n, source: n.heading }))
+  ]) {
+    if (!item.leginfo_bill_id) continue;
+
+    if (!uniqueBills.has(item.leginfo_bill_id)) {
+      uniqueBills.set(item.leginfo_bill_id, {
+        bill_id: item.bill_id,
+        legislative_session: item.legislative_session,
+        leginfo_bill_id: item.leginfo_bill_id,
+        bill_navigation_url: item.bill_navigation_url,
+        bill_text_url: item.bill_text_url,
+        bill_url_status: item.bill_url_status,
+        sources: []
+      });
+    }
+    // Preserve every statutory or heading source associated with this bill.
+    uniqueBills.get(item.leginfo_bill_id).sources.push(item.source);
+  }
+
+  // --------------------------------------------------------------------------
+  // 9. ASSEMBLE MACHINE-READABLE OUTPUT
+  // --------------------------------------------------------------------------
+  // Counts make it easier to compare repeated runs or detect extraction gaps.
+  // Store verification scope explicitly so later stages cannot mistake
+  // generated links for pages independently retrieved from LegInfo.
+  const result = {
+    step: "5-bill-metadata-with-urls",
+    code,
+    source_url: location.href,
+    captured_at: new Date().toISOString(),
+    verification_scope: "DOM-derived metadata; constructed bill URLs not fetched",
+    section_count: sectionRecords.length,
+    section_bill_note_count: sectionRecords.reduce((n, s) => n + s.bill_notes.length, 0),
+    heading_bill_note_count: headingRecords.length,
+    unique_bill_url_count: uniqueBills.size,
+    sections: sectionRecords,
+    heading_notes: headingRecords,
+    unique_bill_urls: [...uniqueBills.values()]
+  };
+
+  // --------------------------------------------------------------------------
+  // 10. MAKE RESULTS AVAILABLE IN DEVTOOLS
+  // --------------------------------------------------------------------------
+  // Persist the result on the current page for inspection until navigation.
+  window.CA_STEP5_BILL_METADATA = result;
+
+  // Print one table of unique bills, including complete navigation/text URLs.
+  console.table([...uniqueBills.values()].map(b => ({
+    bill: b.bill_id,
+    session: b.legislative_session,
+    navigation_url: b.bill_navigation_url,
+    text_url: b.bill_text_url
+  })));
+
+  // Print a second table showing how each heading bill was identified.
+  console.table(headingRecords.map(h => ({
+    heading: h.heading,
+    bill: h.bill_id,
+    resolution: h.bill_resolution,
+    bill_url: h.bill_navigation_url
+  })));
+
+  // --------------------------------------------------------------------------
+  // 11. DOWNLOAD AS UTF-8 TXT CONTAINING INDENTED JSON
+  // --------------------------------------------------------------------------
+  // Do not export CSV/SQL and do not change the live page source.
+  const blob = new Blob([JSON.stringify(result, null, 2)], {
+    type: "text/plain;charset=utf-8"
+  });
+  const downloadURL = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = downloadURL;
+  link.download = `STEP5_${code}_BILL_METADATA_WITH_URLS.txt`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+
+  // Release the temporary Blob URL after the browser has initiated download.
+  setTimeout(() => URL.revokeObjectURL(downloadURL), 5000);
+
+  // Return results for immediate exploration in DevTools.
+  return result;
+})();
